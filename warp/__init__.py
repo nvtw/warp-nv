@@ -369,6 +369,8 @@ from warp._src.utils import timing_print as timing_print
 
 
 from warp._src.utils import ScopedAllocTracker as ScopedAllocTracker
+from warp._src.context import allocation_report as allocation_report
+from warp._src.context import get_alloc_tracker as get_alloc_tracker
 
 
 # category: Profiling > Timing Flags

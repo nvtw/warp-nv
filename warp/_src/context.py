@@ -9754,6 +9754,38 @@ def init():
         _global_alloc_tracker.__enter__()
 
 
+def get_alloc_tracker():
+    """Return the global :class:`~warp.ScopedAllocTracker` activated by
+    :attr:`warp.config.track_allocations`, or ``None`` if tracking is not
+    active.
+    """
+    return _global_alloc_tracker
+
+
+def allocation_report(file=None, sort: str = "size"):
+    """Print a report of all currently tracked memory allocations.
+
+    Requires :attr:`warp.config.track_allocations` to be ``True`` (set before
+    :func:`warp.init`).
+
+    Args:
+        file: File object to write to (defaults to ``sys.stdout``).
+        sort: Sort order for the live-allocation list.  ``"size"`` (default)
+            lists largest allocations first.  ``"time"`` lists allocations in
+            chronological order.
+
+    Raises:
+        RuntimeError: If global allocation tracking is not active.
+    """
+    if _global_alloc_tracker is None:
+        raise RuntimeError(
+            "Global allocation tracking is not active. "
+            "Set wp.config.track_allocations = True before calling wp.init(), "
+            "or use wp.ScopedAllocTracker as a context manager."
+        )
+    _global_alloc_tracker.report(file=file, sort=sort)
+
+
 def get_warp_version():
     """Query the version of the loaded native core library (warp.dll/.so).
 

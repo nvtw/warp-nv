@@ -1848,6 +1848,7 @@ class _AllocRecord:
         "filename",
         "lineno",
         "function",
+        "code_context",
         "array_shape",
         "array_dtype",
     )
@@ -1861,6 +1862,7 @@ class _AllocRecord:
         self.filename = None
         self.lineno = None
         self.function = None
+        self.code_context = None
         self.array_shape = None
         self.array_dtype = None
 
@@ -1906,6 +1908,8 @@ class TrackingAllocator:
                 record.filename = frame_info.filename
                 record.lineno = frame_info.lineno
                 record.function = frame_info.function
+                if frame_info.code_context:
+                    record.code_context = frame_info.code_context[0].strip()
                 break
 
         if ptr in self._records:
@@ -2009,23 +2013,42 @@ class ScopedAllocTracker:
         """Return the list of :class:`TrackingAllocator` instances managed by this tracker."""
         return [t for _, _, t in self._tracking_allocators]
 
-    def report(self, file=None):
+    def report(self, file=None, sort="size"):
         """Print an allocation report for all tracked devices.
+
+        Can be called multiple times -- each call reflects the current state.
 
         Args:
             file: File object to write to (defaults to ``sys.stdout``).
+            sort: Sort order for the live-allocation list.  ``"size"``
+                (default) lists largest allocations first.  ``"time"`` lists
+                allocations in the order they were made.
         """
         if file is None:
             file = sys.stdout
-        allocation_report(self.allocators, file=file)
+        allocation_report(self.allocators, file=file, sort=sort)
+
+    def clear(self):
+        """Reset all tracking data while keeping the tracker active.
+
+        After calling this, subsequent :meth:`report` calls only reflect
+        allocations that occurred after the reset.  Already-allocated arrays
+        are still freed correctly through the base allocator.
+        """
+        for _, _, tracking in self._tracking_allocators:
+            tracking._records.clear()
+            tracking._events.clear()
 
 
-def allocation_report(allocators: list[TrackingAllocator], file=None) -> None:
+def allocation_report(allocators: list[TrackingAllocator], file=None, sort: str = "size") -> None:
     """Print a summary of tracked allocations.
 
     Args:
         allocators: List of :class:`TrackingAllocator` instances to report on.
         file: File object to write to (defaults to ``sys.stdout``).
+        sort: Sort order for the live-allocation list.  ``"size"`` (default)
+            lists largest allocations first.  ``"time"`` lists allocations in
+            chronological order.
     """
     if file is None:
         file = sys.stdout
@@ -2071,21 +2094,26 @@ def allocation_report(allocators: list[TrackingAllocator], file=None) -> None:
             print(f"    {label}: {count} allocs, {_format_bytes(size)}", file=file)
 
     if live_records:
-        live_records.sort(key=lambda r: -r.size)
+        if sort == "time":
+            live_records.sort(key=lambda r: r.timestamp_ns)
+            label = "Live allocations in chronological order"
+        else:
+            live_records.sort(key=lambda r: -r.size)
+            label = "Live allocations by size (largest first)"
         top = live_records[:10]
         print(file=file)
-        print(f"  Top live allocations (up to 10):", file=file)
+        print(f"  {label} (up to 10):", file=file)
         for r in top:
-            parts = [f"    {_format_bytes(r.size)} on {r.device_str}"]
+            header = f"    {_format_bytes(r.size)} on {r.device_str}"
             if r.array_shape is not None:
-                parts.append(f"shape={r.array_shape}")
-            if r.array_dtype is not None:
-                parts.append(f"dtype={r.array_dtype}")
+                header += f", shape={r.array_shape}, dtype={r.array_dtype}"
+            print(header, file=file)
             if r.filename is not None:
-                parts.append(f"at {r.filename}:{r.lineno} in {r.function}()")
+                print(f"      at {r.filename}:{r.lineno} in {r.function}()", file=file)
+                if r.code_context:
+                    print(f"      > {r.code_context}", file=file)
             elif r.scope_path:
-                parts.append(f"scope={'/'.join(r.scope_path)}")
-            print(", ".join(parts), file=file)
+                print(f"      scope={'/'.join(r.scope_path)}", file=file)
 
 
 def _format_bytes(size_in_bytes: int) -> str:
