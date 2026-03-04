@@ -9736,12 +9736,22 @@ def export_builtins(file: io.TextIOBase):  # pragma: no cover
 runtime = None
 
 
+_global_alloc_tracker = None
+
+
 def init():
     """Initialize the Warp runtime. This function must be called before any other API call. If an error occurs an exception will be raised."""
     global runtime
+    global _global_alloc_tracker
 
     if runtime is None:
         runtime = Runtime()
+
+    if warp.config.track_allocations and _global_alloc_tracker is None:
+        from warp._src.utils import ScopedAllocTracker  # noqa: PLC0415
+
+        _global_alloc_tracker = ScopedAllocTracker(name="global", print_report=False)
+        _global_alloc_tracker.__enter__()
 
 
 def get_warp_version():

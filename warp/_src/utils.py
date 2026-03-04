@@ -1836,6 +1836,268 @@ def timing_print(results: list[TimingResult], indent: str = "") -> None:
         print(f"{indent}{agg.elapsed:12.6f} ms | {agg.count:7d} | {device}")
 
 
+class _AllocRecord:
+    """Lightweight record for a single memory allocation."""
+
+    __slots__ = (
+        "size",
+        "device_str",
+        "timestamp_ns",
+        "freed_timestamp_ns",
+        "scope_path",
+        "filename",
+        "lineno",
+        "function",
+        "array_shape",
+        "array_dtype",
+    )
+
+    def __init__(self, size, device_str, scope_path):
+        self.size = size
+        self.device_str = device_str
+        self.timestamp_ns = time.monotonic_ns()
+        self.freed_timestamp_ns = None
+        self.scope_path = scope_path
+        self.filename = None
+        self.lineno = None
+        self.function = None
+        self.array_shape = None
+        self.array_dtype = None
+
+
+class TrackingAllocator:
+    """Allocator wrapper that records allocation metadata.
+
+    Wraps a base allocator with the same duck-type interface (``alloc``,
+    ``free``, ``deleter``).  Used internally by :class:`ScopedAllocTracker`.
+    """
+
+    def __init__(self, allocator):
+        self._allocator = allocator
+        self.device = getattr(allocator, "device", None)
+        self.deleter = lambda ptr, size: self.free(ptr, size)
+        self._records: dict[int, list[_AllocRecord]] = {}
+        self._events: list[tuple[bool, _AllocRecord]] = []
+
+    @property
+    def base_allocator(self):
+        return self._allocator
+
+    def alloc(self, size_in_bytes):
+        ptr = self._allocator.alloc(size_in_bytes)
+
+        scope_path = ScopedAllocTracker._current_scope_path()
+        record = _AllocRecord(size_in_bytes, str(self.device) if self.device else "cpu", scope_path)
+
+        import inspect  # noqa: PLC0415
+
+        is_array = False
+        for frame_info in inspect.stack():
+            f_locals = frame_info.frame.f_locals
+            if not is_array and frame_info.function == "__init__" and warp._src.types.is_array(f_locals.get("self")):
+                is_array = True
+                record.array_shape = f_locals.get("shape")
+                dtype = f_locals.get("dtype")
+                if dtype is not None:
+                    record.array_dtype = warp._src.types.type_repr(dtype)
+
+            package = (frame_info.frame.f_globals.get("__package__") or "").split(".")
+            if package[0] != "warp" or (len(package) > 1 and package[1] == "examples"):
+                record.filename = frame_info.filename
+                record.lineno = frame_info.lineno
+                record.function = frame_info.function
+                break
+
+        if ptr in self._records:
+            self._records[ptr].append(record)
+        else:
+            self._records[ptr] = [record]
+        self._events.append((True, record))
+
+        return ptr
+
+    def free(self, ptr, size_in_bytes):
+        try:
+            record = self._records[ptr][-1]
+            record.freed_timestamp_ns = time.monotonic_ns()
+            self._events.append((False, record))
+        except (KeyError, IndexError):
+            pass
+
+        self._allocator.free(ptr, size_in_bytes)
+
+    def get_live_records(self) -> list[_AllocRecord]:
+        """Return all records that have not been freed."""
+        return [r for rs in self._records.values() for r in rs if r.freed_timestamp_ns is None]
+
+
+class ScopedAllocTracker:
+    """Context manager that tracks memory allocations across all devices.
+
+    On entry, wraps every device allocator with a :class:`TrackingAllocator`.
+    On exit, restores the original allocators and optionally prints a report.
+
+    Args:
+        name: Scope name for grouping allocations.  Nested trackers form a
+            hierarchical scope path, e.g. ``("simulation", "collision")``.
+        print_report: If ``True`` (the default), print an allocation summary
+            on exit.
+
+    Example:
+        .. code-block:: python
+
+            with wp.ScopedAllocTracker("my_scope") as tracker:
+                a = wp.zeros(1000, dtype=wp.float32, device="cpu")
+                b = wp.zeros(1000, dtype=wp.float32, device="cuda:0")
+            # prints allocation summary automatically
+
+    See Also:
+        :attr:`warp.config.track_allocations`
+    """
+
+    _thread_local = threading.local()
+
+    def __init__(self, name: str = "root", print_report: bool = True):
+        self.name = name
+        self.print_report = print_report
+        self._tracking_allocators: list[tuple] = []
+
+    @classmethod
+    def _scope_stack(cls) -> list[str]:
+        if not hasattr(cls._thread_local, "scope_stack"):
+            cls._thread_local.scope_stack = []
+        return cls._thread_local.scope_stack
+
+    @classmethod
+    def _current_scope_path(cls) -> tuple[str, ...]:
+        return tuple(cls._scope_stack())
+
+    def __enter__(self):
+        self._scope_stack().append(self.name)
+
+        devices = warp.get_devices()
+        for device in devices:
+            if device.is_cuda:
+                old_alloc = device.current_allocator
+                tracking = TrackingAllocator(old_alloc)
+                device.current_allocator = tracking
+                self._tracking_allocators.append((device, old_alloc, tracking))
+            else:
+                old_default = device.default_allocator
+                tracking_default = TrackingAllocator(old_default)
+                device.default_allocator = tracking_default
+                self._tracking_allocators.append((device, old_default, tracking_default))
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for device, old_alloc, _tracking in self._tracking_allocators:
+            if device.is_cuda:
+                device.current_allocator = old_alloc
+            else:
+                device.default_allocator = old_alloc
+
+        stack = self._scope_stack()
+        if stack:
+            stack.pop()
+
+        if self.print_report:
+            self.report()
+
+    @property
+    def allocators(self) -> list[TrackingAllocator]:
+        """Return the list of :class:`TrackingAllocator` instances managed by this tracker."""
+        return [t for _, _, t in self._tracking_allocators]
+
+    def report(self, file=None):
+        """Print an allocation report for all tracked devices.
+
+        Args:
+            file: File object to write to (defaults to ``sys.stdout``).
+        """
+        if file is None:
+            file = sys.stdout
+        allocation_report(self.allocators, file=file)
+
+
+def allocation_report(allocators: list[TrackingAllocator], file=None) -> None:
+    """Print a summary of tracked allocations.
+
+    Args:
+        allocators: List of :class:`TrackingAllocator` instances to report on.
+        file: File object to write to (defaults to ``sys.stdout``).
+    """
+    if file is None:
+        file = sys.stdout
+
+    total_allocs = 0
+    total_bytes = 0
+    peak_bytes = 0
+    live_records: list[_AllocRecord] = []
+    scope_sizes: dict[tuple[str, ...], tuple[int, int]] = {}
+
+    for alloc in allocators:
+        cur = 0
+        peak = 0
+        for is_alloc, record in alloc._events:
+            if is_alloc:
+                total_allocs += 1
+                total_bytes += record.size
+                cur += record.size
+                if cur > peak:
+                    peak = cur
+
+                key = record.scope_path
+                count, size = scope_sizes.get(key, (0, 0))
+                scope_sizes[key] = (count + 1, size + record.size)
+            else:
+                cur -= record.size
+        peak_bytes += peak
+        live_records.extend(alloc.get_live_records())
+
+    live_bytes = sum(r.size for r in live_records)
+
+    print(f"Allocation Tracking Report", file=file)
+    print(f"  Total allocations: {total_allocs}", file=file)
+    print(f"  Total allocated:   {_format_bytes(total_bytes)}", file=file)
+    print(f"  Peak usage:        {_format_bytes(peak_bytes)}", file=file)
+    print(f"  Live allocations:  {len(live_records)} ({_format_bytes(live_bytes)})", file=file)
+
+    if scope_sizes:
+        print(file=file)
+        print("  Scope breakdown:", file=file)
+        for path, (count, size) in sorted(scope_sizes.items()):
+            label = "/".join(path) if path else "(no scope)"
+            print(f"    {label}: {count} allocs, {_format_bytes(size)}", file=file)
+
+    if live_records:
+        live_records.sort(key=lambda r: -r.size)
+        top = live_records[:10]
+        print(file=file)
+        print(f"  Top live allocations (up to 10):", file=file)
+        for r in top:
+            parts = [f"    {_format_bytes(r.size)} on {r.device_str}"]
+            if r.array_shape is not None:
+                parts.append(f"shape={r.array_shape}")
+            if r.array_dtype is not None:
+                parts.append(f"dtype={r.array_dtype}")
+            if r.filename is not None:
+                parts.append(f"at {r.filename}:{r.lineno} in {r.function}()")
+            elif r.scope_path:
+                parts.append(f"scope={'/'.join(r.scope_path)}")
+            print(", ".join(parts), file=file)
+
+
+def _format_bytes(size_in_bytes: int) -> str:
+    if size_in_bytes >= 1 << 30:
+        return f"{size_in_bytes / (1 << 30):.2f} GB"
+    if size_in_bytes >= 1 << 20:
+        return f"{size_in_bytes / (1 << 20):.2f} MB"
+    if size_in_bytes >= 1 << 10:
+        return f"{size_in_bytes / (1 << 10):.2f} KB"
+    return f"{size_in_bytes} B"
+
+
 _importing_deprecated_namespace = False
 
 

@@ -2031,6 +2031,46 @@ This results in a printout at runtime to the standard output stream like:
 See :doc:`../deep_dive/profiling` documentation for more information.
 
 
+Allocation Tracking
+^^^^^^^^^^^^^^^^^^^
+
+:class:`wp.ScopedAllocTracker <warp.ScopedAllocTracker>` can be used to track
+memory allocations and identify where memory is being consumed:
+
+.. code:: python
+
+    with wp.ScopedAllocTracker("my_simulation") as tracker:
+        positions = wp.zeros(1000, dtype=wp.vec3, device="cuda:0")
+        velocities = wp.zeros(1000, dtype=wp.vec3, device="cuda:0")
+
+This prints an allocation report on exit showing total allocations, peak usage,
+live allocations, and the Python call sites that triggered them.
+
+Scopes can be nested to group allocations hierarchically:
+
+.. code:: python
+
+    with wp.ScopedAllocTracker("simulation"):
+        with wp.ScopedAllocTracker("collision"):
+            body = wp.zeros(1000, dtype=wp.vec3, device="cuda:0")
+        with wp.ScopedAllocTracker("integration"):
+            vel = wp.zeros(1000, dtype=wp.vec3, device="cuda:0")
+
+The report breaks down allocations by scope path (e.g.,
+``simulation/collision``).
+
+To enable tracking for the entire application, set
+:attr:`warp.config.track_allocations` to ``True`` before calling
+:func:`warp.init`. The report can then be retrieved from the global tracker
+at any time.
+
+.. note::
+
+    Allocation tracking adds overhead due to Python call-stack introspection on
+    every allocation. When disabled (the default), there is zero overhead --
+    no wrapper or flag check exists on the allocation path.
+
+
 Interprocess Communication (IPC)
 --------------------------------
 

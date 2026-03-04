@@ -219,6 +219,17 @@ Only affects systems with CUDA driver versions below 12.3.
 enable_mempools_at_init: bool = True
 """Enable CUDA memory pools during device initialization when supported."""
 
+track_allocations: bool = False
+"""Enable tracking of memory allocations at initialization.
+
+When ``True`` at the time :func:`warp.init` is called, a
+:class:`~warp.ScopedAllocTracker` is automatically activated for all
+devices. For on-demand tracking, use :class:`~warp.ScopedAllocTracker`
+directly as a context manager.
+
+Note: Impacts performance when active due to call-stack introspection.
+"""
+
 max_unroll: int = 16
 """Maximum unroll factor for loops.
 
